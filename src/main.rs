@@ -122,7 +122,7 @@ fn capture_touchpad_input(
     while let Ok(events) = touchpad.device.fetch_events() {
         for event in events {
             timestamp = event.timestamp();
-            log::trace!("Touchpad event: {:?}", event.kind());
+            log::trace!("Touchpad event: {:?} = {}", event.kind(), event.value());
             match event.kind() {
                 evdev::InputEventKind::AbsAxis(axis) => match axis {
                     evdev::AbsoluteAxisType::ABS_X => x = event.value(),
@@ -159,12 +159,15 @@ fn capture_touchpad_input(
                 _ => {}
             }
         }
-        let dx = (x - prev_x) as f64;
-        let dy = (y - prev_y) as f64;
-        let dt = timestamp.duration_since(prev_timestamp).unwrap().as_secs_f64();
-        (vx, vy) = (dx / dt, dy / dt);
-        (prev_x, prev_y) = (x, y);
-        prev_timestamp = timestamp;
+        if x != prev_x || y != prev_y {
+            let dx = (x - prev_x) as f64;
+            let dy = (y - prev_y) as f64;
+            let dt = timestamp.duration_since(prev_timestamp).unwrap().as_secs_f64();
+            (vx, vy) = (dx / dt, dy / dt);
+            (prev_x, prev_y) = (x, y);
+            prev_timestamp = timestamp;
+            log::trace!("Velocity: ({:.02}, {:.02})", vx, vy);
+        }
     }
 }
 
