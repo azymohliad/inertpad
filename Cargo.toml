@@ -1,0 +1,13 @@
+[package]
+name = "inert-pad"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+env_logger = "0.10.0"
+evdev = "0.12.1"
+input-linux = "0.6.0"
+log = "0.4.19"
+nix = "0.26.2"
