@@ -1,14 +1,14 @@
 use std::{
     fs,
     io,
+    sync::mpsc,
     thread,
     time,
-    sync::mpsc,
-    os::unix::prelude::{FileTypeExt, OpenOptionsExt},
+    os::unix::prelude::FileTypeExt,
 };
-use evdev;
-use input_linux as inx;
-use nix::libc::O_NONBLOCK;
+use anyhow::Result;
+use evdev::{self, uinput};
+
 
 enum Message {
     StartMovement(f64, f64),
@@ -17,74 +17,73 @@ enum Message {
 
 
 struct VirtualPointer {
-    uinput: inx::UInputHandle<fs::File>,
+    device: uinput::VirtualDevice,
 }
 
 impl VirtualPointer {
-    fn new() -> io::Result<Self> {
-        let uinput_file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(O_NONBLOCK)
-            .open("/dev/uinput")?;
-        let uinput = inx::UInputHandle::new(uinput_file);
-        uinput.set_evbit(inx::EventKind::Key)?;
-        uinput.set_keybit(inx::Key::ButtonLeft)?;
-        uinput.set_evbit(inx::EventKind::Relative)?;
-        uinput.set_relbit(inx::RelativeAxis::X)?;
-        uinput.set_relbit(inx::RelativeAxis::Y)?;
-
-        let input_id = inx::InputId {
-            bustype: input_linux::sys::BUS_USB,
-            vendor: 0x1234,
-            product: 0x5678,
-            version: 0,
-        };
-        let device_name = b"InertiaPad Virtual Mouse";
-        uinput.create(&input_id, device_name, 0, &[])?;
-        Ok(Self { uinput })
+    fn new() -> Result<Self> {
+        let device = uinput::VirtualDeviceBuilder::new()?
+            .name("InertPad Virtual Mouse")
+            .input_id(evdev::InputId::new(evdev::BusType::BUS_USB, 0x1234, 0x5678, 0))
+            .with_keys(
+                &[
+                    evdev::Key::BTN_LEFT
+                ].into_iter().collect::<evdev::AttributeSet<_>>())?
+            .with_relative_axes(
+                &[
+                    evdev::RelativeAxisType::REL_X,
+                    evdev::RelativeAxisType::REL_Y,
+                ].into_iter().collect::<evdev::AttributeSet<_>>())?
+            .build()?;
+        Ok(Self { device })
     }
 
-    fn set_position(&self, x: i32, y: i32) -> io::Result<()>{
-        const ZERO: inx::EventTime = inx::EventTime::new(0, 0);
+    fn set_position(&mut self, x: i32, y: i32) -> io::Result<()>{
         let events = [
-            *inx::InputEvent::from(inx::RelativeEvent::new(ZERO, inx::RelativeAxis::X, x)).as_raw(),
-            *inx::InputEvent::from(inx::RelativeEvent::new(ZERO, inx::RelativeAxis::Y, y)).as_raw(),
-            *inx::InputEvent::from(inx::SynchronizeEvent::new(ZERO, inx::SynchronizeKind::Report, 0)).as_raw(),
+            evdev::InputEvent::new(evdev::EventType::RELATIVE, evdev::RelativeAxisType::REL_X.0, x),
+            evdev::InputEvent::new(evdev::EventType::RELATIVE, evdev::RelativeAxisType::REL_Y.0, y),
+            evdev::InputEvent::new(evdev::EventType::SYNCHRONIZATION, evdev::Synchronization::SYN_REPORT.0, 0),
         ];
-        self.uinput.write(&events)?;
+        self.device.emit(&events)?;
         Ok(())
     }
 }
 
-impl Drop for VirtualPointer {
-    fn drop(&mut self) {
-        if let Err(error) = self.uinput.dev_destroy() {
-            eprintln!("Failed to destroy virtual pointer device: {}", error);
-        }
-    }
+
+struct Touchpad {
+    device: evdev::Device,
 }
 
-
-fn get_touchpad() -> Option<evdev::Device> {
-    for entry in fs::read_dir("/dev/input/").ok()? {
-        let entry = entry.ok()?;
-        if entry.file_type().ok()?.is_char_device()
-        && entry.file_name().to_str().unwrap().starts_with("event") {
-            let device = evdev::Device::open(entry.path()).ok()?;
-            let keys = device.supported_keys()?;
-            if keys.contains(evdev::Key::BTN_TOOL_FINGER)
-            && keys.contains(evdev::Key::BTN_TOUCH) {
-                return Some(device);
+impl Touchpad {
+    fn default() -> Option<Self> {
+        for entry in fs::read_dir("/dev/input/").ok()? {
+            if let Ok(entry) = entry {
+                if let Ok(touchpad) = Self::from_devinput_entry(entry) {
+                    return Some(touchpad);
+                }
             }
         }
+        None
     }
-    None
+
+    fn from_devinput_entry(entry: fs::DirEntry) -> Result<Self> {
+        if entry.file_type()?.is_char_device()
+        && entry.file_name().to_str().unwrap().starts_with("event") {
+            let device = evdev::Device::open(entry.path())?;
+            if let Some(keys) = device.supported_keys() {
+                if keys.contains(evdev::Key::BTN_TOOL_FINGER)
+                && keys.contains(evdev::Key::BTN_TOUCH) {
+                    return Ok(Self { device });
+                }
+            }
+        }
+        anyhow::bail!("Not a touchpad")
+    }
 }
 
 
 fn capture_touchpad_input(
-    mut touchpad: evdev::Device,
+    mut touchpad: Touchpad,
     sender: mpsc::Sender<Message>,
     speed_threshold: f64)
 {
@@ -96,7 +95,7 @@ fn capture_touchpad_input(
     let mut multitouch_timestamp = time::SystemTime::UNIX_EPOCH;
     let multitouch_timeout = time::Duration::from_millis(500);
 
-    while let Ok(events) = touchpad.fetch_events() {
+    while let Ok(events) = touchpad.device.fetch_events() {
         for event in events {
             timestamp = event.timestamp();
             log::trace!("Touchpad event: {:?}", event.kind());
@@ -111,7 +110,7 @@ fn capture_touchpad_input(
                         log::debug!("Finger Down");
                         let _ = sender.send(Message::StopMovement);
                     } else {
-                        if timestamp.duration_since(multitouch_timestamp).unwrap_or(multitouch_timeout) < multitouch_timeout {
+                        if timestamp.duration_since(multitouch_timestamp).unwrap_or_default() < multitouch_timeout {
                             continue;
                         }
                         let speed = (vx * vx + vy * vy).sqrt();
@@ -146,14 +145,13 @@ fn capture_touchpad_input(
 
 
 fn emulate_mouse_output(
-    vpointer: VirtualPointer,
+    mut vpointer: VirtualPointer,
     receiver: mpsc::Receiver<Message>,
     drag: f64,
     scale: f64,
 ) {
     let min_speed = 1f64;
     let period = time::Duration::from_millis(15);
-    // let drag = 1.0 - (1.0 - drag) / period.as_secs_f64();
     let mut is_moving = false;
     let (mut vx, mut vy) = (0f64, 0f64);
 
@@ -189,15 +187,17 @@ fn main() {
 
     let scale = 0.01;
     let drag = 0.8;
-    let speed_threshold = 1000.0;
+    let speed_threshold = 200.0;
     let (sender, receiver) = mpsc::channel();
 
-    match get_touchpad() {
-        None => eprintln!("Touchpad not found!"),
+    match Touchpad::default() {
+        None => log::error!("Touchpad not found!"),
         Some(touchpad) => {
+            log::info!("Found touchpad: {}", touchpad.device.name().unwrap_or_default());
             match VirtualPointer::new() {
-                Err(e) => eprintln!("Failed to create virtual pointer device: {}", e),
+                Err(e) => log::error!("Failed to create virtual pointer device: {}", e),
                 Ok(vpointer) => {
+                    log::info!("Virtual pointer device is created");
                     thread::spawn(move || {
                         capture_touchpad_input(touchpad, sender, speed_threshold);
                     });
