@@ -1,5 +1,5 @@
 [package]
-name = "inert-pad"
+name = "inertpad"
 version = "0.1.0"
 edition = "2021"
 
@@ -10,3 +10,8 @@ anyhow = "1.0.72"
 env_logger = "0.10.0"
 evdev = "0.12.1"
 log = "0.4.19"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
