@@ -1,35 +1,41 @@
-use std::{
-    fs, io, sync::mpsc, thread, time,
-    os::unix::prelude::FileTypeExt,
-};
+use std::{io, sync::mpsc, thread, time};
 use anyhow::Result;
 use clap::Parser;
 use evdev::{self, uinput};
 
 
+/// Adds inertia to your touchpad
+///
+/// It doesn't alter the original touchpad events, but creates additional
+/// virtual mouse device, which only genertes extra pointer movement events
+/// when it has momentum.
 #[derive(Parser, Debug)]
 #[command(name = "InertPad")]
-#[command(about = "Adds inertia to your touchpad", long_about = None)]
 struct Args {
     /// Inertia drag coefficient (must be between 0.0 and 1.0)
-    #[arg(long, default_value_t = 0.8)]
+    /// Affects inertial movement deceleration.
+    #[arg(long, default_value_t = 0.15)]
     drag: f64,
 
-    /// Touchpad to virtual mouse speed conversion factor
-    #[arg(long, default_value_t = 0.01)]
+    /// Scales velocity from raw touchpad units to virtual mouse units.
+    /// Affects initial inertial movement speed.
+    #[arg(long, default_value_t = 0.0075)]
     speed_factor: f64,
 
-    /// Minimum touchpad pointer speed required to trigger inertia
-    #[arg(long, default_value_t = 200.0)]
+    /// Minimum touchpad pointer speed required to trigger inertial movement.
+    /// Increase if a short tap causes unwanted pointer movement.
+    /// Decrease if intentional swipes don't trigger inertial movement.
+    #[arg(long, default_value_t = 1000.0)]
     speed_threshold: f64,
 
-    /// Position update period in milliseconds
-    #[arg(long, default_value_t = 15)]
-    period: u64,
+    /// Pointer position refresh rate during inertial movement.
+    #[arg(long, default_value_t = 60.0)]
+    refresh_rate: f64,
 
-    /// Multi-touch timeout in milliseconds
+    /// Prevents inertial movement from multitouch by ignoring swipes
+    /// for a specified number of milliseconds after multitouch release.
     #[arg(long, default_value_t = 500)]
-    multitouch_timeout: u64,
+    multitouch_cooldown: u64,
 }
 
 
@@ -96,7 +102,7 @@ fn capture_touchpad_input(
     mut touchpad: Touchpad,
     sender: mpsc::Sender<Message>,
     speed_threshold: f64,
-    multitouch_timeout: u64)
+    multitouch_cooldown: u64)
 {
     let (mut vx, mut vy) = (0f64, 0f64);
     let (mut x, mut y) = (0, 0);
@@ -104,7 +110,7 @@ fn capture_touchpad_input(
     let mut timestamp = time::SystemTime::UNIX_EPOCH;
     let mut prev_timestamp = time::SystemTime::UNIX_EPOCH;
     let mut multitouch_timestamp = time::SystemTime::UNIX_EPOCH;
-    let multitouch_timeout = time::Duration::from_millis(multitouch_timeout);
+    let multitouch_cooldown = time::Duration::from_millis(multitouch_cooldown);
 
     while let Ok(events) = touchpad.device.fetch_events() {
         for event in events {
@@ -118,19 +124,15 @@ fn capture_touchpad_input(
                 }
                 evdev::InputEventKind::Key(key) => match key {
                     evdev::Key::BTN_TOOL_FINGER => if event.value() == 1 {
-                        log::debug!("Finger Down");
                         let _ = sender.send(Message::StopMovement);
                     } else {
                         // Filter out multi-touch lift-off
-                        if timestamp.duration_since(multitouch_timestamp).unwrap_or_default() < multitouch_timeout {
+                        if timestamp.duration_since(multitouch_timestamp).unwrap_or_default() < multitouch_cooldown {
                             continue;
                         }
                         let speed = (vx * vx + vy * vy).sqrt();
                         if speed >= speed_threshold {
-                            log::debug!("Finger Up, velocity = ({:.02}, {:.02})", vx, vy);
                             let _ = sender.send(Message::StartMovement(vx, vy));
-                        } else {
-                            log::debug!("Finger Up");
                         }
                     },
                     evdev::Key::BTN_TOOL_DOUBLETAP |
@@ -164,15 +166,17 @@ fn emulate_mouse_output(
     receiver: mpsc::Receiver<Message>,
     drag: f64,
     speed_factor: f64,
-    period: u64
+    refresh_rate: f64
 ) {
-    let period = time::Duration::from_millis(period);
+    let period = time::Duration::from_secs_f64(refresh_rate.recip());
     let mut is_moving = false;
     let (mut vx, mut vy) = (0f64, 0f64);
+    let deceleration_factor = 1.0 - drag.clamp(0.0, 1.0);
 
     loop {
         if is_moving {
             if let Ok(Message::StopMovement) = receiver.recv_timeout(period) {
+                log::debug!("Emulation: stop movement");
                 is_moving = false;
                 (vx, vy) = (0.0, 0.0);
             } else {
@@ -181,13 +185,14 @@ fn emulate_mouse_output(
                     is_moving = false;
                     (vx, vy) = (0.0, 0.0);
                 } else {
-                    (vx, vy) = (vx * drag, vy * drag);
+                    (vx, vy) = (vx * deceleration_factor, vy * deceleration_factor);
                     log::trace!("Emulation: relative position = ({}, {})", x, y);
                     vpointer.set_position(x, y).unwrap();
                 }
             }
         } else {
             if let Ok(Message::StartMovement(x, y)) = receiver.recv() {
+                log::debug!("Emulation: start movement, velocity = ({:.02}, {:.02})", x, y);
                 is_moving = true;
                 (vx, vy) = (x, y);
             }
@@ -197,7 +202,11 @@ fn emulate_mouse_output(
 
 
 fn main() {
-    env_logger::init();
+    env_logger::Builder::new()
+        .filter_module("inertpad", log::LevelFilter::Info)
+        .parse_default_env()
+        .init();
+
     let args = Args::parse();
     let (sender, receiver) = mpsc::channel();
 
@@ -210,9 +219,9 @@ fn main() {
                 Ok(vpointer) => {
                     log::info!("Virtual pointer device is created");
                     thread::spawn(move || {
-                        capture_touchpad_input(touchpad, sender, args.speed_threshold, args.multitouch_timeout);
+                        capture_touchpad_input(touchpad, sender, args.speed_threshold, args.multitouch_cooldown);
                     });
-                    emulate_mouse_output(vpointer, receiver, args.drag, args.speed_factor, args.period);
+                    emulate_mouse_output(vpointer, receiver, args.drag, args.speed_factor, args.refresh_rate);
                 }
             }
         }
