@@ -79,28 +79,15 @@ struct Touchpad {
 
 impl Touchpad {
     fn default() -> Option<Self> {
-        for entry in fs::read_dir("/dev/input/").ok()? {
-            if let Ok(entry) = entry {
-                if let Ok(touchpad) = Self::from_devinput_entry(entry) {
-                    return Some(touchpad);
+        for (_path, device) in evdev::enumerate() {
+            if let Some(keys) = device.supported_keys() {
+                if keys.contains(evdev::Key::BTN_TOOL_FINGER)
+                && keys.contains(evdev::Key::BTN_TOUCH) {
+                    return Some(Self { device });
                 }
             }
         }
         None
-    }
-
-    fn from_devinput_entry(entry: fs::DirEntry) -> Result<Self> {
-        if entry.file_type()?.is_char_device()
-        && entry.file_name().to_str().unwrap().starts_with("event") {
-            let device = evdev::Device::open(entry.path())?;
-            if let Some(keys) = device.supported_keys() {
-                if keys.contains(evdev::Key::BTN_TOOL_FINGER)
-                && keys.contains(evdev::Key::BTN_TOUCH) {
-                    return Ok(Self { device });
-                }
-            }
-        }
-        anyhow::bail!("Not a touchpad")
     }
 }
 
