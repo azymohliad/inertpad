@@ -125,6 +125,8 @@ fn capture_touchpad_input(
                 evdev::InputEventKind::Key(key) => match key {
                     evdev::Key::BTN_TOOL_FINGER => if event.value() == 1 {
                         let _ = sender.send(Message::StopMovement);
+                        (vx, vy) = (0.0, 0.0);
+                        (prev_x, prev_y) = (x, y); // Prevent velocity overwrite later
                     } else {
                         // Filter out multi-touch lift-off
                         if timestamp.duration_since(multitouch_timestamp).unwrap_or_default() < multitouch_cooldown {
