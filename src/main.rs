@@ -25,7 +25,7 @@ struct Args {
     /// Minimum touchpad pointer speed required to trigger inertial movement.
     /// Increase if a short tap causes unwanted pointer movement.
     /// Decrease if intentional swipes don't trigger inertial movement.
-    #[arg(long, default_value_t = 1000.0)]
+    #[arg(long, default_value_t = 2000.0)]
     speed_threshold: f64,
 
     /// Pointer position refresh rate during inertial movement.
