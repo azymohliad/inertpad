@@ -14,7 +14,7 @@ cargo build --release
 
 ## Usage
 
-It requires root access. It needs read-access to `/dev/input/evdev*` for reading raw touchpad events, and write-access to `/dev/uinput` to create a virtual mouse device. For the first adding a user to `input` group is sufficient, but the second requires root access anyway.
+It requires root access. It needs read-access to `/dev/input/evdev*` for reading raw touchpad events, and write-access to `/dev/uinput` to create a virtual mouse device. For the former adding a user to `input` group is sufficient, but the latter requires root access anyway.
 
 ```
 sudo ./target/release/inertpad
