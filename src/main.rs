@@ -39,17 +39,18 @@ struct Args {
 }
 
 
-enum Message {
+enum MomentumMessage {
     StartMovement(f64, f64),
     StopMovement,
 }
 
 
-struct VirtualPointer {
+/// Emulates mouse device (via uinput) which performs inertial pointer movement
+struct VirtualMouse {
     device: uinput::VirtualDevice,
 }
 
-impl VirtualPointer {
+impl VirtualMouse {
     fn new() -> Result<Self> {
         let device = uinput::VirtualDeviceBuilder::new()?
             .name("InertPad Virtual Mouse")
@@ -76,9 +77,50 @@ impl VirtualPointer {
         self.device.emit(&events)?;
         Ok(())
     }
+
+    fn run_emulation(
+        &mut self,
+        receiver: mpsc::Receiver<MomentumMessage>,
+        drag: f64,
+        speed_factor: f64,
+        refresh_rate: f64
+    ) {
+        let period = time::Duration::from_secs_f64(refresh_rate.recip());
+        let mut is_moving = false;
+        let (mut vx, mut vy) = (0f64, 0f64);
+        let deceleration_factor = 1.0 - drag.clamp(0.0, 1.0);
+
+        loop {
+            if is_moving {
+                if let Ok(MomentumMessage::StopMovement) = receiver.recv_timeout(period) {
+                    log::debug!("Emulation: stop movement");
+                    is_moving = false;
+                    (vx, vy) = (0.0, 0.0);
+                } else {
+                    let (x, y) = ((vx * speed_factor) as i32, (vy * speed_factor) as i32);
+                    if x == 0 && y == 0 {
+                        is_moving = false;
+                        (vx, vy) = (0.0, 0.0);
+                    } else {
+                        (vx, vy) = (vx * deceleration_factor, vy * deceleration_factor);
+                        log::trace!("Emulation: relative position = ({}, {})", x, y);
+                        self.set_position(x, y).unwrap();
+                    }
+                }
+            } else {
+                if let Ok(MomentumMessage::StartMovement(x, y)) = receiver.recv() {
+                    log::debug!("Emulation: start movement, velocity = ({:.02}, {:.02})", x, y);
+                    is_moving = true;
+                    (vx, vy) = (x, y);
+                }
+            }
+        }
+    }
+
 }
 
 
+/// Captures raw evdev touchpad events and forwards
 struct Touchpad {
     device: evdev::Device,
 }
@@ -95,108 +137,67 @@ impl Touchpad {
         }
         None
     }
-}
 
+    fn run_capture(
+        &mut self,
+        sender: mpsc::Sender<MomentumMessage>,
+        speed_threshold: f64,
+        multitouch_cooldown: u64)
+    {
+        let (mut vx, mut vy) = (0f64, 0f64);
+        let (mut x, mut y) = (0, 0);
+        let (mut prev_x, mut prev_y)  = (0, 0);
+        let mut timestamp = time::SystemTime::UNIX_EPOCH;
+        let mut prev_timestamp = time::SystemTime::UNIX_EPOCH;
+        let mut multitouch_timestamp = time::SystemTime::UNIX_EPOCH;
+        let multitouch_cooldown = time::Duration::from_millis(multitouch_cooldown);
 
-fn capture_touchpad_input(
-    mut touchpad: Touchpad,
-    sender: mpsc::Sender<Message>,
-    speed_threshold: f64,
-    multitouch_cooldown: u64)
-{
-    let (mut vx, mut vy) = (0f64, 0f64);
-    let (mut x, mut y) = (0, 0);
-    let (mut prev_x, mut prev_y)  = (0, 0);
-    let mut timestamp = time::SystemTime::UNIX_EPOCH;
-    let mut prev_timestamp = time::SystemTime::UNIX_EPOCH;
-    let mut multitouch_timestamp = time::SystemTime::UNIX_EPOCH;
-    let multitouch_cooldown = time::Duration::from_millis(multitouch_cooldown);
-
-    while let Ok(events) = touchpad.device.fetch_events() {
-        for event in events {
-            timestamp = event.timestamp();
-            log::trace!("Touchpad event: {:?} = {}", event.kind(), event.value());
-            match event.kind() {
-                evdev::InputEventKind::AbsAxis(axis) => match axis {
-                    evdev::AbsoluteAxisType::ABS_X => x = event.value(),
-                    evdev::AbsoluteAxisType::ABS_Y => y = event.value(),
-                    _ => (),
-                }
-                evdev::InputEventKind::Key(key) => match key {
-                    evdev::Key::BTN_TOOL_FINGER => if event.value() == 1 {
-                        let _ = sender.send(Message::StopMovement);
-                        (vx, vy) = (0.0, 0.0);
-                        (prev_x, prev_y) = (x, y); // Prevent velocity overwrite later
-                    } else {
-                        // Filter out multi-touch lift-off
-                        if timestamp.duration_since(multitouch_timestamp).unwrap_or_default() < multitouch_cooldown {
-                            continue;
+        while let Ok(events) = self.device.fetch_events() {
+            for event in events {
+                timestamp = event.timestamp();
+                log::trace!("Touchpad event: {:?} = {}", event.kind(), event.value());
+                match event.kind() {
+                    evdev::InputEventKind::AbsAxis(axis) => match axis {
+                        evdev::AbsoluteAxisType::ABS_X => x = event.value(),
+                        evdev::AbsoluteAxisType::ABS_Y => y = event.value(),
+                        _ => (),
+                    }
+                    evdev::InputEventKind::Key(key) => match key {
+                        evdev::Key::BTN_TOOL_FINGER => if event.value() == 1 {
+                            let _ = sender.send(MomentumMessage::StopMovement);
+                            (vx, vy) = (0.0, 0.0);
+                            (prev_x, prev_y) = (x, y); // Prevent velocity overwrite later
+                        } else {
+                            // Filter out multi-touch lift-off
+                            if timestamp.duration_since(multitouch_timestamp).unwrap_or_default() < multitouch_cooldown {
+                                continue;
+                            }
+                            let speed = (vx * vx + vy * vy).sqrt();
+                            if speed >= speed_threshold {
+                                let _ = sender.send(MomentumMessage::StartMovement(vx, vy));
+                            }
+                        },
+                        evdev::Key::BTN_TOOL_DOUBLETAP |
+                        evdev::Key::BTN_TOOL_TRIPLETAP |
+                        evdev::Key::BTN_TOOL_QUADTAP |
+                        evdev::Key::BTN_TOOL_QUINTTAP => if event.value() == 1 {
+                            let _ = sender.send(MomentumMessage::StopMovement);
+                        } else {
+                            multitouch_timestamp = timestamp;
                         }
-                        let speed = (vx * vx + vy * vy).sqrt();
-                        if speed >= speed_threshold {
-                            let _ = sender.send(Message::StartMovement(vx, vy));
-                        }
-                    },
-                    evdev::Key::BTN_TOOL_DOUBLETAP |
-                    evdev::Key::BTN_TOOL_TRIPLETAP |
-                    evdev::Key::BTN_TOOL_QUADTAP |
-                    evdev::Key::BTN_TOOL_QUINTTAP => if event.value() == 1 {
-                        let _ = sender.send(Message::StopMovement);
-                    } else {
-                        multitouch_timestamp = timestamp;
+                        _ => {}
                     }
                     _ => {}
                 }
-                _ => {}
             }
-        }
-        if x != prev_x || y != prev_y {
-            let dx = (x - prev_x) as f64;
-            let dy = (y - prev_y) as f64;
-            let dt = timestamp.duration_since(prev_timestamp).unwrap().as_secs_f64();
-            (vx, vy) = (dx / dt, dy / dt);
-            (prev_x, prev_y) = (x, y);
-            prev_timestamp = timestamp;
-            log::trace!("Velocity: ({:.02}, {:.02})", vx, vy);
-        }
-    }
-}
-
-
-fn emulate_mouse_output(
-    mut vpointer: VirtualPointer,
-    receiver: mpsc::Receiver<Message>,
-    drag: f64,
-    speed_factor: f64,
-    refresh_rate: f64
-) {
-    let period = time::Duration::from_secs_f64(refresh_rate.recip());
-    let mut is_moving = false;
-    let (mut vx, mut vy) = (0f64, 0f64);
-    let deceleration_factor = 1.0 - drag.clamp(0.0, 1.0);
-
-    loop {
-        if is_moving {
-            if let Ok(Message::StopMovement) = receiver.recv_timeout(period) {
-                log::debug!("Emulation: stop movement");
-                is_moving = false;
-                (vx, vy) = (0.0, 0.0);
-            } else {
-                let (x, y) = ((vx * speed_factor) as i32, (vy * speed_factor) as i32);
-                if x == 0 && y == 0 {
-                    is_moving = false;
-                    (vx, vy) = (0.0, 0.0);
-                } else {
-                    (vx, vy) = (vx * deceleration_factor, vy * deceleration_factor);
-                    log::trace!("Emulation: relative position = ({}, {})", x, y);
-                    vpointer.set_position(x, y).unwrap();
-                }
-            }
-        } else {
-            if let Ok(Message::StartMovement(x, y)) = receiver.recv() {
-                log::debug!("Emulation: start movement, velocity = ({:.02}, {:.02})", x, y);
-                is_moving = true;
-                (vx, vy) = (x, y);
+            if x != prev_x || y != prev_y {
+                let dx = (x - prev_x) as f64;
+                let dy = (y - prev_y) as f64;
+                let dt = timestamp.duration_since(prev_timestamp).unwrap().as_secs_f64();
+                (vx, vy) = (dx / dt, dy / dt);
+                (prev_x, prev_y) = (x, y);
+                prev_timestamp = timestamp;
+                log::trace!("Velocity: ({:.02}, {:.02})", vx, vy);
             }
         }
     }
@@ -214,19 +215,18 @@ fn main() {
 
     match Touchpad::default() {
         None => log::error!("Touchpad not found!"),
-        Some(touchpad) => {
+        Some(mut touchpad) => {
             log::info!("Found touchpad: {}", touchpad.device.name().unwrap_or_default());
-            match VirtualPointer::new() {
-                Err(e) => log::error!("Failed to create virtual pointer device: {}", e),
-                Ok(vpointer) => {
-                    log::info!("Virtual pointer device is created");
+            match VirtualMouse::new() {
+                Err(e) => log::error!("Failed to create virtual mouse device: {}", e),
+                Ok(mut vmouse) => {
+                    log::info!("Virtual mouse device is created");
                     thread::spawn(move || {
-                        capture_touchpad_input(touchpad, sender, args.speed_threshold, args.multitouch_cooldown);
+                        touchpad.run_capture(sender, args.speed_threshold, args.multitouch_cooldown);
                     });
-                    emulate_mouse_output(vpointer, receiver, args.drag, args.speed_factor, args.refresh_rate);
+                    vmouse.run_emulation(receiver, args.drag, args.speed_factor, args.refresh_rate);
                 }
             }
         }
     }
 }
-
