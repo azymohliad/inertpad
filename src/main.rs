@@ -49,48 +49,26 @@ struct VirtualMouse {
 
 impl VirtualMouse {
     fn new() -> Result<Self> {
+        use evdev::{AttributeSet, BusType, InputId, Key, RelativeAxisType};
         let device = uinput::VirtualDeviceBuilder::new()?
             .name("InertPad Virtual Mouse")
-            .input_id(evdev::InputId::new(
-                evdev::BusType::BUS_USB,
-                0x1234,
-                0x5678,
-                0,
-            ))
-            .with_keys(
-                &[evdev::Key::BTN_LEFT]
-                    .into_iter()
-                    .collect::<evdev::AttributeSet<_>>(),
-            )?
+            .input_id(InputId::new(BusType::BUS_USB, 0x1234, 0x5678, 0))
+            .with_keys(&[Key::BTN_LEFT].into_iter().collect::<AttributeSet<_>>())?
             .with_relative_axes(
-                &[
-                    evdev::RelativeAxisType::REL_X,
-                    evdev::RelativeAxisType::REL_Y,
-                ]
-                .into_iter()
-                .collect::<evdev::AttributeSet<_>>(),
+                &[RelativeAxisType::REL_X, RelativeAxisType::REL_Y]
+                    .into_iter()
+                    .collect::<AttributeSet<_>>(),
             )?
             .build()?;
         Ok(Self { device })
     }
 
     fn set_position(&mut self, x: i32, y: i32) -> io::Result<()> {
+        use evdev::{EventType, InputEvent, RelativeAxisType, Synchronization};
         let events = [
-            evdev::InputEvent::new(
-                evdev::EventType::RELATIVE,
-                evdev::RelativeAxisType::REL_X.0,
-                x,
-            ),
-            evdev::InputEvent::new(
-                evdev::EventType::RELATIVE,
-                evdev::RelativeAxisType::REL_Y.0,
-                y,
-            ),
-            evdev::InputEvent::new(
-                evdev::EventType::SYNCHRONIZATION,
-                evdev::Synchronization::SYN_REPORT.0,
-                0,
-            ),
+            InputEvent::new(EventType::RELATIVE, RelativeAxisType::REL_X.0, x),
+            InputEvent::new(EventType::RELATIVE, RelativeAxisType::REL_Y.0, y),
+            InputEvent::new(EventType::SYNCHRONIZATION, Synchronization::SYN_REPORT.0, 0),
         ];
         self.device.emit(&events)?;
         Ok(())
@@ -163,6 +141,7 @@ impl Touchpad {
         speed_threshold: f64,
         multitouch_cooldown: u64,
     ) {
+        use evdev::{AbsoluteAxisType, InputEventKind, Key};
         let (mut vx, mut vy) = (0f64, 0f64);
         let (mut x, mut y) = (0, 0);
         let (mut prev_x, mut prev_y) = (0, 0);
@@ -176,13 +155,13 @@ impl Touchpad {
                 timestamp = event.timestamp();
                 log::trace!("Touchpad event: {:?} = {}", event.kind(), event.value());
                 match event.kind() {
-                    evdev::InputEventKind::AbsAxis(axis) => match axis {
-                        evdev::AbsoluteAxisType::ABS_X => x = event.value(),
-                        evdev::AbsoluteAxisType::ABS_Y => y = event.value(),
+                    InputEventKind::AbsAxis(axis) => match axis {
+                        AbsoluteAxisType::ABS_X => x = event.value(),
+                        AbsoluteAxisType::ABS_Y => y = event.value(),
                         _ => (),
                     },
-                    evdev::InputEventKind::Key(key) => match key {
-                        evdev::Key::BTN_TOOL_FINGER => {
+                    InputEventKind::Key(key) => match key {
+                        Key::BTN_TOOL_FINGER => {
                             if event.value() == 1 {
                                 let _ = sender.send(MomentumMessage::StopMovement);
                                 (vx, vy) = (0.0, 0.0);
@@ -202,10 +181,10 @@ impl Touchpad {
                                 }
                             }
                         }
-                        evdev::Key::BTN_TOOL_DOUBLETAP
-                        | evdev::Key::BTN_TOOL_TRIPLETAP
-                        | evdev::Key::BTN_TOOL_QUADTAP
-                        | evdev::Key::BTN_TOOL_QUINTTAP => {
+                        Key::BTN_TOOL_DOUBLETAP
+                        | Key::BTN_TOOL_TRIPLETAP
+                        | Key::BTN_TOOL_QUADTAP
+                        | Key::BTN_TOOL_QUINTTAP => {
                             if event.value() == 1 {
                                 let _ = sender.send(MomentumMessage::StopMovement);
                             } else {
