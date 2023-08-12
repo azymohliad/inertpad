@@ -107,12 +107,10 @@ impl VirtualMouse {
                         self.set_position(x, y).unwrap();
                     }
                 }
-            } else {
-                if let Ok(MomentumMessage::StartMovement(x, y)) = receiver.recv() {
-                    log::debug!("Emulation: start movement, velocity = ({:.02}, {:.02})", x, y);
-                    is_moving = true;
-                    (vx, vy) = (x, y);
-                }
+            } else if let Ok(MomentumMessage::StartMovement(x, y)) = receiver.recv() {
+                log::debug!("Emulation: start movement, velocity = ({:.02}, {:.02})", x, y);
+                is_moving = true;
+                (vx, vy) = (x, y);
             }
         }
     }
